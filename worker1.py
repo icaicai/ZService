@@ -10,7 +10,7 @@ def echo(msg):
 
 worker = Worker('worker1', 'echo', 'tcp://localhost:9999')
 worker.add_method(echo)
-worker.connect_to_manager()
+# worker.connect_to_manager()
 # worker.connect_to_broker('tcp://localhost:5002')
 worker.start()
 

@@ -1,6 +1,8 @@
 #coding=utf8
 
 import logging
+from gevent import monkey
+monkey.patch_all()
 from zservice import CloudBroker
 
 logging.basicConfig(format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.DEBUG)
@@ -13,5 +15,5 @@ uris['statebe_uri'] = 'tcp://127.0.0.1:7004'
 uris['manager_uri'] = 'tcp://localhost:9999'
 
 broker = CloudBroker('broker2', **uris)
-broker.connect_to_manager()
+broker.register_to_manager()
 broker.start()

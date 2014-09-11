@@ -8,6 +8,7 @@ logging.basicConfig(format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S
 
 client = Client('client1', 'tcp://localhost:9999')
 client.connect_to_broker('tcp://localhost:5003')
+# client.broker_uri = 'tcp://localhost:5003'
 
 
 echo = client.use_service('echo')
