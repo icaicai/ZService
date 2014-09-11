@@ -4,8 +4,9 @@ import logging
 import time
 import zmq
 from .util import split_address
-from .protocol import C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP
+from .protocol import C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP, C_REGISTER
 from .protocol import pack, unpack
+from exception import InvalidBrokerUri, RPCSerivceNotFound, RPCServiceNotMethod, RPCServiceException
 
 class Client(object):
 
@@ -29,12 +30,12 @@ class Client(object):
         self.poller = zmq.Poller()
         self.broker_uri = None
 
-    def connect_to_manager(self):
+    def register_to_manager(self):
         socket = self.ctx.socket(zmq.REQ)
         socket.connect(self.manager_uri)
         poller = zmq.Poller()
         poller.register(socket)
-        to_send = [C_SETUP, 'CLIENT', self.identity]
+        to_send = [C_REGISTER, 'CLIENT', self.identity]
         socket.send_multipart(to_send)
 
         retries = 3
@@ -87,7 +88,7 @@ class Client(object):
             broker_uri = self.broker_uri
 
         if not broker_uri:
-            raise Exception(u'broker_uri is empty')
+            raise InvalidBrokerUri()
 
 
         logging.info('connect to broker %s' % broker_uri)
@@ -109,7 +110,7 @@ class Client(object):
         if code == "200":
             return ServiceProxy(self, service)
         else:
-            raise Exception('service %s is not exists' % service)
+            raise RPCSerivceNotFound('service %s is not exists' % service)
 
 
     def send(self, service, args=None, kwargs=None):
@@ -124,13 +125,14 @@ class Client(object):
 
         retries = self.retries
         while retries > 0:
-            print 'send ', time.time()
+            # print 'send ', time.time()
             self.socket.send_multipart(to_send)
-            print 'sent ', time.time()
+            # print 'sent ', time.time()
             try:
                 events = self.poller.poll(self.timeout)
             except zmq.ZMQError:
-                break  # interrupted
+                logging.exception('zmq.ZMQError')
+                continue
             except KeyboardInterrupt:
                 break
 
@@ -148,6 +150,12 @@ class Client(object):
 
                 if cmd == C_REPLY:
                     result = unpack(msg[0])
+                elif cmd == C_EXCEPTION:
+                    e = unpack(msg[0])
+                    raise e
+                elif cmd == C_ERROR:
+                    e = unpack(msg[0])
+                    raise e
                 else:
                     result = msg[0]
 

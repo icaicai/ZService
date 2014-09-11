@@ -1,14 +1,16 @@
-
+#coding=utf8
 #cluster
 
 import logging
 from binascii import hexlify
 import time
-import zmq
+# import zmq
+import gevent
+import zmq.green as zmq
 from .util import split_address
-from .protocol import C_HELLO, C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP
+from .protocol import C_HELLO, C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP, C_REGISTER
 from .protocol import pack, unpack
-
+from exception import InvalidBrokerUri, RPCSerivceNotFound, RPCServiceNotMethod, RPCServiceException
 
 
 
@@ -51,12 +53,6 @@ class CloudBroker(object):
         self._peers = {}
         self._stateinfo = StateInfo()
 
-
-
-    # def init_cloud(self, cloudfe_uri, statebe_uri):
-
-
-
         self.cloudfe = self.ctx.socket(zmq.ROUTER)
         self.cloudfe.setsockopt(zmq.IDENTITY, self.identity)
         self.cloudfe.bind(cloudfe_uri)
@@ -71,12 +67,21 @@ class CloudBroker(object):
         self.statebe.bind(statebe_uri)
 
 
-    def connect_to_manager(self):
+        self.pollerbe.register(self.clientfe, zmq.POLLIN)
+        self.pollerbe.register(self.cloudfe, zmq.POLLIN)
+
+        self.pollerbe.register(self.workerbe, zmq.POLLIN)
+        self.pollerbe.register(self.cloudbe, zmq.POLLIN)
+        self.pollerbe.register(self.statefe, zmq.POLLIN)    
+
+
+
+    def register_to_manager(self):
         self.mgrsock = socket = self.ctx.socket(zmq.DEALER)
         socket.connect(self.manager_uri)
         poller = zmq.Poller()
         poller.register(socket)
-        to_send = ['', C_SETUP, 'BROKER', self.identity, self.client_uri, self.worker_uri, self.cloudfe_uri, self.statebe_uri]
+        to_send = ['', C_REGISTER, 'BROKER', self.identity, self.client_uri, self.worker_uri, self.cloudfe_uri, self.statebe_uri]
         socket.send_multipart(to_send)
 
         retries = 3
@@ -94,12 +99,12 @@ class CloudBroker(object):
 
             if socket in events:
                 msg = socket.recv_multipart()
-                print 'broker conf recv', msg
+                # print 'broker conf recv', msg
                 empty = msg.pop(0)
                 cmd = msg.pop(0)
                 conf = unpack(msg[0])
 
-                print conf
+                # print conf
                 other_brokers = []
                 if 'other_brokers':
                     other_brokers = conf['other_brokers']
@@ -108,10 +113,16 @@ class CloudBroker(object):
                 for key in conf:
                     setattr(self, key, conf[key])
 
+
+
+                poller.unregister(socket)
+
+
+
                 if hasattr(self, 'ctrl_uri'):
                     self.statefe.connect(self.ctrl_uri)
 
-                poller.unregister(socket)
+                
                 # self.pollerbe.register(self.mgrsock)
 
                 for data in other_brokers:
@@ -120,7 +131,11 @@ class CloudBroker(object):
                     self._peers[identity] = peer
                     self.connect_to_peer(data['cloudfe_uri'], data['statebe_uri'])
 
-                    self.cloudbe.send_multipart([identity, '', C_HELLO])
+                    # say hello
+                    print 'say hello to', identity
+                    # self.cloudbe.send_multipart([identity, '', C_HELLO])
+                    gevent.spawn_later(1000, self.cloudbe.send_multipart, [identity, '', C_HELLO])
+
 
                 break
 
@@ -150,7 +165,7 @@ class CloudBroker(object):
             ap = None
             for peer_id in peers:
                 peer = self._peers.get(peer_id)
-                print '==', peer_id, peer, peer.services
+                # print '==', peer_id, peer, peer.services
                 if peer and service in peer.services:
                     worker_num = peer.services[service]
                     if worker_num > waiting_num:
@@ -195,7 +210,6 @@ class CloudBroker(object):
 
 
 
-
     def delete_worker(self, worker, disconnect):
 
         if disconnect:
@@ -203,12 +217,13 @@ class CloudBroker(object):
             self.workerbe.send_multipart(to_send)
 
         if worker.service is not None:
-            # worker.service.waiting.remove(worker)
-            self._services[worker.service].remove(worker.identity)
+            service = worker.service
+            self._services[service].remove(worker.identity)
+            # self._services[service]
         self._workers.pop(worker.identity, None)
         
         # self.publish_state('service.delete', worker.service)
-        self.publish_state('worker.del', [worker.identity, worker.service])
+        self.publish_state('worker.disconnected', [worker.identity, worker.service])
 
 
     # process worker command
@@ -230,7 +245,7 @@ class CloudBroker(object):
                 self._services[service] = q
 
 
-            self.publish_state('worker.add', [wid, service])
+            self.publish_state('worker.connected', [wid, service])
 
             logging.info('new worker <%s, %s>' % (wid, service))
 
@@ -242,7 +257,7 @@ class CloudBroker(object):
             return
 
 
-        print 'on_worker_reply', wid, msg, cmd
+        logging.debug('on_worker_reply %s %s %s' % (wid, msg, cmd))
 
         worker.waiting = True
         service = worker.service
@@ -303,14 +318,14 @@ class CloudBroker(object):
         cmd = msg.pop(0)
 
         logging.debug( 'process_cloud_worker recv %s %s' % (paddr, msg))
-        # if cmd == C_READY:
-        #     identity = msg.pop(0)
-        #     if pid not in self._peers:
-        #         p = Peer(pid, paddr)
-        # else:
-        caddr, msg = split_address(msg)
-        msg.insert(0, cmd)
-        self.respond_client(caddr, msg)
+
+        if cmd == C_HELLO:
+            pass
+
+        else:
+            caddr, msg = split_address(msg)
+            msg.insert(0, cmd)
+            self.respond_client(caddr, msg)
 
 
     def process_cloud_state(self, topic, sender, msg):
@@ -322,19 +337,31 @@ class CloudBroker(object):
 
         logging.debug( 'process_cloud_state recv %s %s %s' % (topic, sender, data))
 
-        if topic.startswith('worker.'):
+
+        if topic == 'services.state':
+            peer = self._peers.get(sender)
+            if not peer:
+                return
+
+            for service in data:
+                if service not in self._services:
+                    self._services[service] = Service(service, self._stateinfo)
+                
+                self._services[service].put_peer(sender)
+                peer.services[service] = data[service]
+
+        elif topic.startswith('worker.'):
             peer = self._peers.get(sender)
 
             if not peer:
                 return
 
             print '>>', peer.services
-            if topic == 'worker.state':
-                for service in data:
-                    peer.services[service] = data[service]
-            elif topic == 'worker.add':
-                print 'worker.add', data
-                service = data[1]
+            service = data[1]
+
+            if topic == 'worker.connected':
+                print 'worker.connected', data
+                
                 # if service in peer.services:
                 #     peer.services[service] += 1
                 # else:
@@ -344,20 +371,24 @@ class CloudBroker(object):
                     sobj.put_peer(peer.identity)
                 except KeyError:
                     pass
-            elif topic == 'worker.del':
+            elif topic == 'worker.disconnected':
                 pass
 
-        elif topic.startswith('control.'):
+        elif topic.startswith('broker.'):
             identity = data['identity']
 
             if identity == self.identity:
                 return
 
-            if topic == 'control.new_broker':
+            if topic == 'broker.join':
                 peer = Peer(identity, data['cloudfe_uri'], data['statebe_uri'])
                 self._peers[identity] = peer
                 self.connect_to_peer(data['cloudfe_uri'], data['statebe_uri'])
-            elif topic == 'control.del_broker':
+
+                # print '-----hello', identity
+                # self.cloudbe.send_multipart([identity,'', C_HELLO])
+
+            elif topic == 'broker.failure':
                 if identity in self._peers:
                     p = self._peers[identity]
                     self.cloudbe.disconnect(p.cloudfe_uri)
@@ -373,7 +404,6 @@ class CloudBroker(object):
             returncode = "200" if name in self._services else "404"
         #msg[0] = returncode
 
-        # insert the protocol header and service name after the routing envelope ([client, ''])
         # msg = msg[:2] + [MDP.C_CLIENT, service] + msg[2:]
         msg = [C_REPLY, "mmi.service", pack((name, returncode))]
         # self.socket.send_multipart(msg)
@@ -441,8 +471,36 @@ class CloudBroker(object):
     def process_cloud_client(self, paddr, msg):
         cmd = msg.pop(0)  # always 0x01
 
+        logging.debug('process_cloud_client %s %s' % (paddr, msg))
+
         if cmd == C_HELLO:
-            pass
+            
+            addr = paddr[0]
+            if msg:
+                
+                data = unpack(msg[0])
+
+                peer = self._peers.get(addr)
+
+                print data, peer
+                if not peer:
+                    return
+
+                for service in data:
+                    if service not in self._services:
+                        self._services[service] = Service(service, self._stateinfo)
+                    
+                    self._services[service].put_peer(addr)
+                    peer.services[service] = data[service] 
+
+            else:
+                #发送服务信息到新的broker
+                sv = {}
+                for service in self._services:
+                    sv[service] = len(self._services[service].worker_q)
+
+                self.cloudbe.send_multipart([addr, '', C_HELLO, pack(sv)])
+
         elif cmd == C_REQUEST:
             caddr, msg = split_address(msg)
             # addr = [paddr, caddr]
@@ -485,12 +543,7 @@ class CloudBroker(object):
 
 
     def start(self):
-        self.pollerbe.register(self.clientfe, zmq.POLLIN)
-        self.pollerbe.register(self.cloudfe, zmq.POLLIN)
-
-        self.pollerbe.register(self.workerbe, zmq.POLLIN)
-        self.pollerbe.register(self.cloudbe, zmq.POLLIN)
-        self.pollerbe.register(self.statefe, zmq.POLLIN)        
+    
 
         logging.info("I: start broker: client <%s>   worker <%s>" % (self.client_uri, self.worker_uri))
 
@@ -522,7 +575,6 @@ class CloudBroker(object):
                 self.process_cloud_worker(peer, msg)
 
 
-
             if self.statefe in events:
                 topic, sender, msg = self.statefe.recv_multipart()
                 self.process_cloud_state(topic, sender, msg)
@@ -542,14 +594,13 @@ class CloudBroker(object):
                 # print 'clientfe recv', time.time(), msg
                 sender, msg = split_address(msg)
                 self.process_client(sender, msg)        
-               
+         
 
             self.send_heartbeats()
 
             changed = self._stateinfo.get_changed()
             if changed:
-                self.publish_state('worker.state', changed)
-
+                self.publish_state('services.state', changed)
 
     def stop(self):
         self.started = False

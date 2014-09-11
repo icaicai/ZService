@@ -16,7 +16,8 @@ C_DISCONNECT    =   b"\x06"
 C_EXCEPTION     =   b"\x010"
 C_ERROR         =   b"\x011"
 
-C_SETUP         =   b"\x020"
+C_REGISTER      =   b"\x020"
+C_SETUP         =   b"\x021"
 
 
 
@@ -25,3 +26,6 @@ def pack(data):
 
 def unpack(bytes):
 	return pickle.loads(bytes)
+
+
+

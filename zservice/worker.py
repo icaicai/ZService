@@ -4,8 +4,9 @@ import logging
 import time
 import zmq
 from .util import split_address
-from .protocol import C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP
+from .protocol import C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_REGISTER, C_SETUP
 from .protocol import pack, unpack
+from exception import InvalidBrokerUri, RPCSerivceNotFound, RPCServiceNotMethod, RPCServiceException
 
 
 class Worker(object):
@@ -29,12 +30,13 @@ class Worker(object):
         self.broker_uri = None
 
 
-    def connect_to_manager(self):
+    def register_to_manager(self):
         socket = self.ctx.socket(zmq.REQ)
         socket.connect(self.manager_uri)
         poller = zmq.Poller()
         poller.register(socket)
-        to_send = [C_SETUP, 'WORKER', self.identity, self.service]
+
+        to_send = [C_REGISTER, 'WORKER', self.identity, self.service]
         socket.send_multipart(to_send)
 
         retries = 3
@@ -44,27 +46,30 @@ class Worker(object):
             try:
                 events = dict(poller.poll(3000))
             except zmq.ZMQError:
+                logging.exception('zmq.ZMQError')
                 break  # interrupted
             except KeyboardInterrupt:
                 break
 
-            if socket in events:
-                msg = socket.recv_multipart()
-                cmd = msg.pop(0)
-                conf = unpack(msg[0])
+            if events:
+                if socket in events:
+                    msg = socket.recv_multipart()
+                    cmd = msg.pop(0)
 
-                for key in conf:
-                    setattr(self, key, conf[key])
+                    if cmd == C_SETUP:
+                        pass
+                        conf = unpack(msg[0])
 
-                if hasattr(self, 'ctrl_uri') and self.statefe is None:
-                    self.statefe = self.ctx.socket(zmq.SUB)
-                    self.statefe.setsockopt(zmq.SUBSCRIBE, b"control.")
-                    self.statefe.connect(self.ctrl_uri)
+                        for key in conf:
+                            setattr(self, key, conf[key])
 
-                    self.poller.register(self.statefe, zmq.POLLIN)
+                        # if hasattr(self, 'ctrl_uri') and self.statefe is None:
+                        #     self.statefe = self.ctx.socket(zmq.SUB)
+                        #     self.statefe.setsockopt(zmq.SUBSCRIBE, b"control.")
+                        #     self.statefe.connect(self.ctrl_uri)
+                        #     self.poller.register(self.statefe, zmq.POLLIN)
 
-
-                self.connect_to_broker()
+                        self.connect_to_broker()
 
                 break
 
@@ -74,6 +79,7 @@ class Worker(object):
                 if retries == 0:
                     logging.warn('cannt connect to manager %s ' % self.manager_uri)
                     break
+
 
 
 
@@ -128,6 +134,8 @@ class Worker(object):
             msg = [service, (u'%s has no method "%s"' % (self.service, method).encode('ascii'))]
             self.send_reply(sender, msg, err=True)
         except:
+            logging.exception('exe ')
+            exc = sys.exc_info()
             msg = [service, (u'%s exception' % service).encode('ascii')]
             self.send_reply(sender, msg, exc=True)
 
@@ -181,8 +189,6 @@ class Worker(object):
         else:
             to_send.append(msg)
 
-
-
         self.socket.send_multipart(to_send)
 
 
@@ -195,9 +201,14 @@ class Worker(object):
 
 
     def start(self):
-        self.started = True
 
-        
+        if self.broker_uri is None:
+            self.register_to_manager()
+        else:
+            self.connect_to_broker()
+
+
+        self.started = True
 
         self.liveness = self.HEARTBEAT_LIVENESS
         self.heartbeat_at = time.time() + 1e-3 * self.HEARTBEAT_INTERVAL
@@ -206,11 +217,14 @@ class Worker(object):
             try:
                 events = dict(self.poller.poll(self.HEARTBEAT_INTERVAL))
             except zmq.ZMQError:
+                logging.exception('zmq.ZMQError')
                 break  # interrupted
             except KeyboardInterrupt:
                 break
 
             if events:
+                self.liveness = self.HEARTBEAT_LIVENESS #
+
                 if self.socket in events:
                     msg = self.socket.recv_multipart()
 
@@ -218,13 +232,11 @@ class Worker(object):
                     empty = msg.pop(0)
                     cmd = msg.pop(0)
 
-                    self.liveness = self.HEARTBEAT_LIVENESS #
-
                     self.process_message(cmd, msg)
 
-                if self.statefe and self.statefe in events:
-                    topic, sender, msg = self.statefe.recv_multipart()
-                    print 'worker recv', topic, sender, msg
+                # if self.statefe and self.statefe in events:
+                #     topic, sender, msg = self.statefe.recv_multipart()
+                #     logging.debug('worker recv %s %s %s' % (topic, sender, msg))
             else:
                 self.liveness -= 1
 
@@ -236,7 +248,7 @@ class Worker(object):
                 except KeyboardInterrupt:
                     break
                 ##
-                self.connect_to_manager()
+                self.register_to_manager()
                 # self.connect_to_broker()
 
             # Send HEARTBEAT if it's time
