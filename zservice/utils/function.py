@@ -1,3 +1,4 @@
+#coding=utf8
 
 
 def split_address(msg):

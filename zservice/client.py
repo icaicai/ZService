@@ -1,18 +1,18 @@
 #coding=utf8
 
+from __future__ import absolute_import
 import logging
 import time
-import zmq
-from .util import split_address
+import zmq.green as zmq
+from .base import Base
+from .utils.function import split_address
 from .protocol import C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP, C_REGISTER
-from .protocol import pack, unpack
-from exception import InvalidBrokerUri, RPCSerivceNotFound, RPCServiceNotMethod, RPCServiceException
+from .serializer import loads, dumps
+from .exceptions import InvalidUri, SerivceNotFound, ServiceNotMethod, ServiceException
 
-class Client(object):
+class Client(Base):
 
-    HEARTBEAT_LIVENESS = 5
-    HEARTBEAT_INTERVAL = 1000
-    HEARTBEAT_EXPIRY = HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
+    role = 'CLIENT'
 
 
     def __init__(self, identity, manager_uri, retries=3, timeout=2000):
@@ -29,6 +29,8 @@ class Client(object):
         self.statefe = None
         self.poller = zmq.Poller()
         self.broker_uri = None
+
+        self._ext_reg_msg = ['']
 
     def register_to_manager(self):
         socket = self.ctx.socket(zmq.REQ)
@@ -52,7 +54,7 @@ class Client(object):
             if socket in events:
                 msg = socket.recv_multipart()
                 cmd = msg.pop(0)
-                conf = unpack(msg[0])
+                conf = loads(msg[0])
 
                 for key in conf:
                     setattr(self, key, conf[key])
@@ -110,16 +112,16 @@ class Client(object):
         if code == "200":
             return ServiceProxy(self, service)
         else:
-            raise RPCSerivceNotFound('service %s is not exists' % service)
+            raise SerivceNotFound('service %s is not exists' % service)
 
 
     def send(self, service, args=None, kwargs=None):
         to_send = [C_REQUEST, service]
 
         if args:
-            to_send.append(pack(args))
+            to_send.append(dumps(args))
         if kwargs:
-            to_send.append(pack(kwargs))
+            to_send.append(dumps(kwargs))
 
         reply = None
 
@@ -149,12 +151,12 @@ class Client(object):
 
 
                 if cmd == C_REPLY:
-                    result = unpack(msg[0])
+                    result = loads(msg[0])
                 elif cmd == C_EXCEPTION:
-                    e = unpack(msg[0])
+                    e = loads(msg[0])
                     raise e
                 elif cmd == C_ERROR:
-                    e = unpack(msg[0])
+                    e = loads(msg[0])
                     raise e
                 else:
                     result = msg[0]

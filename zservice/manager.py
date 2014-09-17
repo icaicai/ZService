@@ -3,10 +3,13 @@
 import logging
 from binascii import hexlify
 import time
-import zmq
-from .util import split_address
+import zmq.green as zmq
+from .base import Base
+from .resource import ResourceManager
+from .utils.function import split_address
+from .utils.timer import Timer
 from .protocol import C_READY, C_REQUEST, C_REPLY, C_HEARTBEAT, C_DISCONNECT, C_EXCEPTION, C_ERROR, C_SETUP, C_REGISTER
-from .protocol import pack, unpack
+from .serializer import loads, dumps
 
 
 
@@ -37,7 +40,7 @@ CONFIG = {
 
 
 
-class Manager(object):
+class Manager(Base):
 
     HEARTBEAT_LIVENESS = 5
     HEARTBEAT_INTERVAL = 1000
@@ -51,6 +54,8 @@ class Manager(object):
 
         self._cur_worker_idx = 0
         self._cur_client_idx = 0
+
+        self._resmgr = ResourceManager()
 
         self.heartbeat_at = time.time() + 1e-3*self.HEARTBEAT_INTERVAL
 
@@ -78,39 +83,40 @@ class Manager(object):
 
     def publish_control(self, topic, msg):
         logging.debug('publish control %s => %s' %  (topic, msg))
-        to_send = [topic, self.identity, pack(msg)]
+        to_send = [topic, self.identity, dumps(msg)]
         self.ctrl_pub.send_multipart(to_send)
 
 
-    def purge_broker(self):
+    def heartbeat(self):
 
-        if (time.time() > self.heartbeat_at):
-            bw = []
-            for bid in self._brokers:
-                broker = self._brokers[bid]
-                if broker['expiry'] < time.time():
-                    bw.append((bid, broker))
+        bw = []
+        peers = self._resmgr.peers
+        for bid in peers:
+            broker = peers[bid]
+            if not broker.isalive():
+                bw.append((bid, broker))
 
-            for bid, broker in bw:
-                self.publish_control('broker.failure', {'identity': bid})
-                del self._brokers[bid]
+        for bid, broker in bw:
+            self.publish_control('broker.failure', {'identity': bid})
+            self._resmgr.remove_peer(bid)
 
-            # send to broker
-            # self.mgrsock.send_multipart([C_HEARTBEAT, 'BROKER', self.identity])
-            self.heartbeat_at = time.time() + 1e-3*self.HEARTBEAT_INTERVAL
-
+        # send to broker
+        # self.mgrsock.send_multipart([C_HEARTBEAT, 'BROKER', self.identity])
 
 
 
-    def get_broker(self, role):
+
+
+    def get_broker_uri(self, role):
         m = None
         broker = None
-        for bid in self._brokers:
-            b = self._brokers[bid]
+        peers = self._resmgr.peers
+        for bid in peers:
+            b = peers[bid]
             if role == 'WORKER':
-                num = b['workers']
+                num = b.worker_total
             elif role == 'CLIENT':
-                num = b['clients']
+                num = b.client_total
             else:
                 break
 
@@ -122,9 +128,9 @@ class Manager(object):
             return None
 
         if role == 'WORKER':
-            addr = broker['worker_uri']
+            addr = broker.worker_uri
         else:
-            addr = broker['client_uri']
+            addr = broker.client_uri
 
         return addr
 
@@ -136,9 +142,9 @@ class Manager(object):
         conf['ctrl_uri'] = self.ctrl_uri
 
         if role == 'WORKER':
-            conf['broker_uri'] = self.get_broker(role)
+            conf['broker_uri'] = self.get_broker_uri(role)
         elif role == 'CLIENT':
-            conf['broker_uri'] = self.get_broker(role)
+            conf['broker_uri'] = self.get_broker_uri(role)
         elif role == 'BROKER':
             pass
 
@@ -161,20 +167,26 @@ class Manager(object):
         if cmd == C_REGISTER:
             role = msg.pop(0)
             identity = msg.pop(0)
+            print role == 'BROKER'
+            conf = {}
 
             if role == 'WORKER':
-                info = {
-                    'service': msg[0]
-                }
-                self._workers[identity] = info
+                service = msg[0]
+                self._resmgr.add_worker(identity, service)
+                # info = {
+                #     'service': msg[0]
+                # }
+                # self._workers[identity] = info
             elif role == 'CLIENT':
-                info = {
-                    'service': msg and msg[0] or None
-                }
-                self._clients[identity] = info
+                self._resmgr.add_client()
+                # info = {
+                #     'service': msg and msg[0] or None
+                # }
+                # self._clients[identity] = info
             elif role == 'BROKER':
+                print msg
                 info = {
-                    'address': sender,
+                    'address': identity,
                     'client_uri' : msg[0],
                     'worker_uri' : msg[1],
                     'cloudfe_uri' : msg[2],
@@ -182,9 +194,30 @@ class Manager(object):
                     'services': {}, #wid service_name
                     'workers': 0,
                     'clients': 0,
-                    'expiry': time.time() + 1e-3*self.HEARTBEAT_EXPIRY
-                }
-                self._brokers[identity] = info
+                    'lifetime': self.HEARTBEAT_EXPIRY
+                }                
+                self._resmgr.add_peer(identity, **info)
+
+                # self._brokers[identity] = info
+
+                ob = []
+                peers = self._resmgr.peers
+                for pid in peers:
+                    if pid != identity:
+                        p = peers[pid]
+                        ss = {}
+                        for s in p.services:
+                            ss[s] = p.services[s]
+
+                        data = {
+                            'identity': pid,
+                            'address':p.address,
+                            'cloudfe_uri' : p.cloudfe_uri,
+                            'statebe_uri' : p.statebe_uri,
+                            'services' : ss
+                        }
+                        ob.append(data)
+                conf['other_brokers'] = ob
 
                 # 连接到broker的statebe，用于接收broker的状态信息
                 self.state_sub.connect(info['statebe_uri'])
@@ -199,24 +232,12 @@ class Manager(object):
                 # self.ctrl_pub.send_multipart(['control.new_broker', self.identity, pack(data)])
                 self.publish_control('broker.join', data)
 
-            conf = self.get_conf(role, identity)
+            cfg = self.get_conf(role, identity)
 
-            if role == 'BROKER':
-                ob = []
-                for bid in self._brokers:
-                    if bid != identity:
-                        b = self._brokers[bid]
-                        data = {
-                            'identity': bid,
-                            'address': b['address'],
-                            'cloudfe_uri' : b['cloudfe_uri'],
-                            'statebe_uri' : b['statebe_uri']
-                        }
-                        ob.append(data)
-                conf['other_brokers'] = ob
+            conf.update(cfg)
 
 
-            msg = [C_SETUP, pack(conf)]
+            msg = [C_SETUP, dumps(conf)]
             self.send_reply(sender, msg)
 
             print "%s %s %s connected" % (sender, role, identity)
@@ -224,35 +245,45 @@ class Manager(object):
         elif cmd == C_HEARTBEAT:
             role, identity = msg
             if role == 'BROKER':
-                self._brokers[identity]['expiry'] = time.time() + 1e-3*self.HEARTBEAT_EXPIRY
+                # self._brokers[identity]['expiry'] = time.time() + 1e-3*self.HEARTBEAT_EXPIRY
+                peer = self._resmgr.get_peer(identity)
+                if peer:
+                    peer.on_heartbeat()
 
 
 
     def on_state_message(self, topic, sender, msg):
-        # print 'on_state_message', topic, sender, msg
-        if topic.startswith('worker.'):
-            b = self._brokers.get(sender)
-            if not b:
-                logging.warn(u'cannt find broker %s' % sender)
-                return
+        msg = loads(msg)
+        print 'on_state_message', topic, sender, msg
+        if topic == 'services.status':
+            self._resmgr.update_peer_service_status(sender, msg)
+        elif topic.startswith('worker.'):
+            # b = self._brokers.get(sender)
+            # if not b:
+            #     logging.warn(u'cannt find broker %s' % sender)
+            #     return
+            waddr = msg[0]
+            service = msg[1]
 
-            if topic == 'worker.connected':
-                b['workers'] += 1
-                wid = msg[0]
-                service = msg[1]
-                if service not in b['services']:
-                    b['services'][service] = set()
-                    b['services'][service].add(wid)
-                else:
-                    b['services'][service].add(wid)
+            if topic == 'worker.ready':
+                self._resmgr.add_peer_worker(sender, waddr, service)
+                # b['workers'] += 1
+                # wid = msg[0]
+                # service = msg[1]
+                # if service not in b['services']:
+                #     b['services'][service] = set()
+                #     b['services'][service].add(wid)
+                # else:
+                #     b['services'][service].add(wid)
             elif topic == 'worker.disconnected':
-                b['workers'] -= 1
-                wid = msg[0]
-                service = msg[1]
-                try:
-                    b['services'][service].remove(wid)
-                except:
-                    pass
+                self._resmgr.remove_peer_worker(sender, waddr, service)
+                # b['workers'] -= 1
+                # wid = msg[0]
+                # service = msg[1]
+                # try:
+                #     b['services'][service].remove(wid)
+                # except:
+                #     pass
         elif topic.startswith('client.'):
             b = self._brokers.get(sender)
             if topic == 'client.connected':
@@ -265,6 +296,7 @@ class Manager(object):
         self.started = True
 
         logging.info("I: start manager:  <%s>   <%s>" % (self.conf_uri, self.ctrl_uri))
+        self._timer = Timer(self.heartbeat, self.HEARTBEAT_INTERVAL)
 
         while self.started:
             try:
@@ -285,8 +317,9 @@ class Manager(object):
                 self.on_state_message(topic, sender, msg)
 
 
-            self.purge_broker()
-
 
     def stop(self):
         self.started = False
+        self._timer.stop()
+
+        

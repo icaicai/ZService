@@ -15,5 +15,5 @@ uris['statebe_uri'] = 'tcp://127.0.0.1:7002'
 uris['manager_uri'] = 'tcp://localhost:9999'
 
 broker = CloudBroker('broker1', **uris)
-broker.register_to_manager()
+broker.register()
 broker.start()
